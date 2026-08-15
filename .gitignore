@@ -1,0 +1,7 @@
+# Artifact-runtime copy of the page: same content as index.html, minus the
+# <!DOCTYPE>/<head>/<body> wrapper that the artifact host supplies itself.
+# index.html is the version this repo publishes.
+algorithm-guide.html
+
+.DS_Store
+.playwright-mcp/
