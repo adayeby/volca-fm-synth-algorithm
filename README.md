@@ -2,7 +2,7 @@
 
 An interactive map of the **Korg Volca FM**'s 32 FM algorithms.
 
-### ▶ [Open the interactive version](https://USERNAME.github.io/volca-fm-synth-algorithm/)
+### ▶ [Open the interactive version](https://adayeby.github.io/volca-fm-synth-algorithm/)
 
 Korg ships the 32 algorithms as a single dense reference sheet. It tells you how each one is
 wired, but not what any of them *sounds* like, or which to reach for when you want a bell
