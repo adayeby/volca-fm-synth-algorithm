@@ -542,10 +542,34 @@ function select(i, sound){
 // ---------- audio ----------
 let actx = null, liveMaster = null, muted = false;
 
+// Mobile browsers suspend the context on backgrounding — iOS reports the
+// non-standard state "interrupted", and a revived context sometimes never
+// returns to "running", so fall back to rebuilding it inside the tap gesture.
+function ensureCtx(){
+  if(!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+  if(actx.state === 'running') return Promise.resolve();
+  const timeout = new Promise(res => setTimeout(res, 250));
+  return Promise.race([actx.resume().catch(()=>{}), timeout]).then(()=>{
+    if(actx.state !== 'running'){
+      try{ actx.close(); }catch(e){}
+      actx = new (window.AudioContext || window.webkitAudioContext)();
+      return actx.resume().catch(()=>{});
+    }
+  });
+}
+
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState === 'visible' && actx && actx.state !== 'running'){
+    actx.resume().catch(()=>{});
+  }
+});
+
 function play(a, pos){
+  ensureCtx().then(()=>{ schedule(a, pos); }).catch(()=>{});
+}
+
+function schedule(a, pos){
   try{
-    if(!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
-    if(actx.state === 'suspended') actx.resume();
     if(liveMaster){ try{ liveMaster.disconnect(); }catch(e){} }
 
     const t = actx.currentTime, dur = 1.8;
