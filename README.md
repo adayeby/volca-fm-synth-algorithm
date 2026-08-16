@@ -33,8 +33,9 @@ more additive, organ-like sound; longer chains mean denser, more metallic FM.
 
 ## Running it
 
-`index.html` is a single self-contained file — no build step, no dependencies, no network
-requests. Open it directly in a browser, or serve the folder:
+`index.html` needs no build step and makes no network requests — its one dependency,
+[Tone.js](https://tonejs.github.io/), is vendored in [`vendor/tone.js`](vendor/tone.js) rather
+than pulled from a CDN. Open it directly in a browser, or serve the folder:
 
 ```sh
 python3 -m http.server 8000
@@ -48,3 +49,8 @@ grid provides on the first algorithm you select.
 The routing data is the standard DX7 algorithm set, which the Volca FM implements and which its
 patches are SysEx-compatible with. Diagrams are generated from that data at runtime rather than
 drawn by hand, so each one is derived from the same operator graph the audio engine plays.
+
+Each algorithm's sound is a live FM patch built with Tone.js: one sine oscillator per operator,
+wired exactly as the diagram shows. Feedback operators are real self/loop modulation — routed
+through a single-sample delay so the resulting audio-graph cycle stays stable — rather than a
+cosmetic detail confined to the diagram.
