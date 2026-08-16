@@ -9,6 +9,7 @@
 <meta property="og:description" content="Click any of the Volca FM's 32 algorithms to see how it's wired and hear what it sounds like.">
 <meta property="og:type" content="website">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>%F0%9F%8E%9B%EF%B8%8F</text></svg>">
+<script src="vendor/tone.js"></script>
 <style>
   :root {
     --bg: #1c1815;
@@ -256,6 +257,34 @@
     font-size: 11px; color: var(--muted); text-align: center; margin: 0;
   }
 
+  .knobs { display: flex; flex-direction: column; gap: 12px; }
+  .knob { display: flex; flex-direction: column; gap: 5px; }
+  .knob .lbl {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted);
+    display: flex; justify-content: space-between;
+  }
+  .knob .lbl b {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    color: var(--ink); font-weight: 600; letter-spacing: 0; text-transform: none; font-size: 11.5px;
+  }
+  .knob input[type="range"] {
+    -webkit-appearance: none; appearance: none; width: 100%; height: 4px;
+    background: var(--hairline); border-radius: 2px; outline: none; cursor: pointer; margin: 0;
+  }
+  .knob input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%;
+    background: var(--modulator); cursor: pointer; border: 2px solid var(--surface);
+  }
+  .knob input[type="range"]::-moz-range-thumb {
+    width: 14px; height: 14px; border-radius: 50%;
+    background: var(--modulator); cursor: pointer; border: 2px solid var(--surface);
+  }
+  .knob.fb input[type="range"]::-webkit-slider-thumb { background: var(--feedback); }
+  .knob.fb input[type="range"]::-moz-range-thumb { background: var(--feedback); }
+  .knob input[type="range"]:focus-visible { outline: 2px solid var(--modulator); outline-offset: 3px; }
+  .knob.fb input[type="range"]:focus-visible { outline-color: var(--feedback); }
+
   .empty {
     display: flex; flex-direction: column; align-items: center; justify-content: center;
     gap: 10px; flex: 1; color: var(--muted); font-size: 14px; text-align: center;
@@ -340,6 +369,16 @@
         <div class="actions" style="margin-top:4px">
           <button class="playbtn" id="playBtn">&#9654; Hear it</button>
           <button class="mutebtn" id="muteBtn" aria-pressed="false">sound: on</button>
+        </div>
+        <div class="knobs" style="margin-top:14px">
+          <label class="knob">
+            <span class="lbl">FM intensity <b id="kFmVal">100%</b></span>
+            <input type="range" id="kFm" min="0" max="200" value="100" step="5" aria-label="FM modulation intensity">
+          </label>
+          <label class="knob fb">
+            <span class="lbl">Feedback amount <b id="kFbVal">15%</b></span>
+            <input type="range" id="kFb" min="0" max="60" value="15" step="1" aria-label="Feedback amount">
+          </label>
         </div>
         <p class="hint" style="margin-top:10px">green = heard directly &middot; blue = bends the pitch of the box below it</p>
       </div>
@@ -540,27 +579,38 @@ function select(i, sound){
 }
 
 // ---------- audio ----------
-let actx = null, liveMaster = null, muted = false;
+let liveNodes = null, muted = false;
+
+// user-tunable knobs — the two highest-leverage numbers in the FM graph:
+// how hard modulators bend their target's pitch, and how much of that
+// same effect recirculates through feedback loops.
+let fmIntensity = 1.0, fbAmount = 0.15;
+
+const kFm = document.getElementById('kFm'), kFmVal = document.getElementById('kFmVal');
+const kFb = document.getElementById('kFb'), kFbVal = document.getElementById('kFbVal');
+kFm.addEventListener('input', ()=>{ fmIntensity = kFm.value / 100; kFmVal.textContent = kFm.value + '%'; });
+kFb.addEventListener('input', ()=>{ fbAmount = kFb.value / 100; kFbVal.textContent = kFb.value + '%'; });
 
 // Mobile browsers suspend the context on backgrounding — iOS reports the
 // non-standard state "interrupted", and a revived context sometimes never
 // returns to "running", so fall back to rebuilding it inside the tap gesture.
 function ensureCtx(){
-  if(!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
-  if(actx.state === 'running') return Promise.resolve();
-  const timeout = new Promise(res => setTimeout(res, 250));
-  return Promise.race([actx.resume().catch(()=>{}), timeout]).then(()=>{
-    if(actx.state !== 'running'){
-      try{ actx.close(); }catch(e){}
-      actx = new (window.AudioContext || window.webkitAudioContext)();
-      return actx.resume().catch(()=>{});
-    }
+  return Tone.start().catch(()=>{}).then(()=>{
+    const ctx = Tone.getContext();
+    if(ctx.state === 'running') return;
+    const timeout = new Promise(res => setTimeout(res, 250));
+    return Promise.race([ctx.resume().catch(()=>{}), timeout]).then(()=>{
+      if(ctx.state !== 'running'){
+        Tone.setContext(new Tone.Context());
+        return Tone.start().catch(()=>{});
+      }
+    });
   });
 }
 
 document.addEventListener('visibilitychange', ()=>{
-  if(document.visibilityState === 'visible' && actx && actx.state !== 'running'){
-    actx.resume().catch(()=>{});
+  if(document.visibilityState === 'visible' && Tone.getContext().state !== 'running'){
+    Tone.getContext().resume().catch(()=>{});
   }
 });
 
@@ -568,17 +618,23 @@ function play(a, pos){
   ensureCtx().then(()=>{ schedule(a, pos); }).catch(()=>{});
 }
 
+function disposeLive(nodes){
+  nodes.forEach(n => { try{ n.dispose(); }catch(e){} });
+}
+
 function schedule(a, pos){
   try{
-    if(liveMaster){ try{ liveMaster.disconnect(); }catch(e){} }
+    if(liveNodes){ disposeLive(liveNodes); liveNodes = null; }
 
-    const t = actx.currentTime, dur = 1.8;
-    const master = actx.createGain();
+    const nodes = [];
+    const t = Tone.now(), dur = 1.8;
+
+    const master = new Tone.Gain(0.0001).toDestination();
     master.gain.setValueAtTime(0.0001, t);
     master.gain.linearRampToValueAtTime(0.45, t + 0.012);
     master.gain.exponentialRampToValueAtTime(0.001, t + dur);
-    master.connect(actx.destination);
-    liveMaster = master;
+    nodes.push(master);
+    liveNodes = nodes;
 
     const carFreq = {};
     a.c.forEach((op,i)=>{ carFreq[op] = 220 * (i+1); });
@@ -591,29 +647,49 @@ function schedule(a, pos){
     const oscs = {};
     for(let op=1; op<=6; op++){
       if(!pos[op]) continue;
-      const o = actx.createOscillator();
       const lv = pos[op].y;
       const ratio = a.c.includes(op) ? 1 : (lv===1 ? 2 : lv===2 ? 3 : 4.5);
-      o.frequency.value = rootFreq(op) * ratio;
+      const o = new Tone.Oscillator(rootFreq(op) * ratio, 'sine');
       oscs[op] = o;
+      nodes.push(o);
     }
 
     a.c.forEach(op=>{
-      const g = actx.createGain();
-      g.gain.value = 0.9 / a.c.length;
+      const g = new Tone.Gain(0.9 / a.c.length);
       oscs[op].connect(g); g.connect(master);
+      nodes.push(g);
     });
 
-    a.m.forEach(([s,tt])=>{
+    function patchModulator(s, tt, indexScale){
       const lv = pos[s].y;
-      const idx = [0, 2.4, 1.7, 1.2][Math.min(lv,3)] * oscs[tt].frequency.value;
-      const g = actx.createGain();
+      const idx = ([0, 2.4, 1.7, 1.2][Math.min(lv,3)] || 1.2) * oscs[tt].frequency.value * indexScale;
+      const g = new Tone.Gain(idx);
       g.gain.setValueAtTime(idx, t);
       g.gain.exponentialRampToValueAtTime(idx*0.04 + 0.01, t + 1.1);
+      nodes.push(g);
+      return g;
+    }
+
+    a.m.forEach(([s,tt])=>{
+      const g = patchModulator(s, tt, fmIntensity);
       oscs[s].connect(g); g.connect(oscs[tt].frequency);
     });
 
+    // Feedback: an operator modulating itself (or looping into an earlier
+    // one) is a genuine cycle in the audio graph. Web Audio mutes zero-delay
+    // cycles outright, so a single-sample Tone.Delay keeps it stable while
+    // staying inaudible as a discrete echo — same trick real FM chips use.
+    const [fs, fd] = a.f;
+    if(oscs[fs] && oscs[fd]){
+      const delay = new Tone.Delay(1 / Tone.getContext().sampleRate);
+      const g = patchModulator(fs, fd, fbAmount);
+      oscs[fs].connect(delay); delay.connect(g); g.connect(oscs[fd].frequency);
+      nodes.push(delay);
+    }
+
     Object.values(oscs).forEach(o=>{ o.start(t); o.stop(t + dur + 0.1); });
+
+    setTimeout(()=>{ if(liveNodes === nodes){ disposeLive(nodes); liveNodes = null; } }, (dur + 0.3) * 1000);
   }catch(e){ /* audio unavailable — page stays visual-only */ }
 }
 
@@ -627,7 +703,7 @@ muteBtn.addEventListener('click', ()=>{
   muteBtn.textContent = 'sound: ' + (muted ? 'off' : 'on');
   muteBtn.classList.toggle('muted', muted);
   muteBtn.setAttribute('aria-pressed', String(muted));
-  if(muted && liveMaster){ try{ liveMaster.disconnect(); }catch(e){} }
+  if(muted && liveNodes){ disposeLive(liveNodes); liveNodes = null; }
 });
 </script>
 
