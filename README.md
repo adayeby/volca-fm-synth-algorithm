@@ -48,3 +48,11 @@ grid provides on the first algorithm you select.
 The routing data is the standard DX7 algorithm set, which the Volca FM implements and which its
 patches are SysEx-compatible with. Diagrams are generated from that data at runtime rather than
 drawn by hand, so each one is derived from the same operator graph the audio engine plays.
+
+Feedback is real, not just drawn: the looped operator runs as a small inline AudioWorklet that
+folds each output sample back into its own phase — per-sample, the way the DX chips do it. The
+two loop-style algorithms (4 and 6) route through a one-render-quantum delay instead, the
+closest a Web Audio graph cycle allows, as phase modulation so the pitch stays put. Feedback
+depth is a fixed constant in the code like every other patch parameter: routing is the only
+variable between the 32 sounds. Where AudioWorklet isn't available the page plays without
+feedback, as before.

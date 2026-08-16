@@ -542,20 +542,74 @@ function select(i, sound){
 // ---------- audio ----------
 let actx = null, liveMaster = null, muted = false;
 
+// Feedback depths — fixed on purpose. Like operator ratios and envelope times,
+// these belong to the one patch every algorithm plays, so that routing stays
+// the only variable between the 32 sounds. Tune by ear, here, once.
+const FB_BETA = 1.3; // self-feedback phase depth (radians) — saw-like grit
+const FB_LOOP = 0.2; // loop feedback (algos 4 & 6) phase-mod depth (radians).
+                     // Audibly, it fills in the even harmonics the plain 2:1
+                     // stack lacks. Keep well under ~0.3: the loop runs through
+                     // a one-quantum delay, and larger depths push the delayed
+                     // cycle past unity gain into inharmonic self-oscillation.
+
+// A feedback operator needs its own output folded back into its phase on the
+// next sample — a per-sample cycle no plain node graph can express — so the
+// looped operator runs as a tiny inline AudioWorklet. Averaging the last two
+// samples damps the period-2 chatter one-sample feedback develops at high
+// depth; the DX7 does the same. Input 0, when connected, is extra phase
+// modulation in radians (used by the two loop-feedback algorithms).
+const FB_PROC = `
+registerProcessor('fb-op', class extends AudioWorkletProcessor {
+  constructor(o){
+    super();
+    const p = o.processorOptions;
+    this.inc = 2 * Math.PI * p.freq / sampleRate;
+    this.beta = p.beta; this.betaMin = p.beta * 0.04;
+    this.decay = Math.pow(0.04, 1 / (1.1 * sampleRate)); // mirror the modulator envelope
+    this.life = p.life; this.phase = 0; this.s1 = 0; this.s2 = 0; this.n = 0;
+  }
+  process(inputs, outputs){
+    const out = outputs[0][0], pm = inputs[0] && inputs[0][0];
+    for(let i = 0; i < out.length; i++){
+      const s = Math.sin(this.phase + this.beta * (this.s1 + this.s2) * 0.5 + (pm ? pm[i] : 0));
+      out[i] = s; this.s2 = this.s1; this.s1 = s;
+      this.phase += this.inc;
+      if(this.phase > 2 * Math.PI) this.phase -= 2 * Math.PI;
+      if(this.beta > this.betaMin) this.beta *= this.decay;
+    }
+    this.n += out.length;
+    return this.n < this.life; // self-dispose once the note is over
+  }
+});`;
+const FB_URL = URL.createObjectURL(new Blob([FB_PROC], {type: 'application/javascript'}));
+
+// Compile the processor into the context once (again after a mobile rebuild).
+// Resolves either way: without AudioWorklet the page just plays feedback-free.
+function prepFeedback(ctx){
+  if(!ctx.audioWorklet) return Promise.resolve();
+  if(!ctx._fbLoad) ctx._fbLoad = ctx.audioWorklet.addModule(FB_URL)
+    .then(()=>{ ctx._fbReady = true; }).catch(()=>{});
+  return ctx._fbLoad;
+}
+
 // Mobile browsers suspend the context on backgrounding — iOS reports the
 // non-standard state "interrupted", and a revived context sometimes never
 // returns to "running", so fall back to rebuilding it inside the tap gesture.
 function ensureCtx(){
   if(!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
-  if(actx.state === 'running') return Promise.resolve();
-  const timeout = new Promise(res => setTimeout(res, 250));
-  return Promise.race([actx.resume().catch(()=>{}), timeout]).then(()=>{
-    if(actx.state !== 'running'){
-      try{ actx.close(); }catch(e){}
-      actx = new (window.AudioContext || window.webkitAudioContext)();
-      return actx.resume().catch(()=>{});
-    }
-  });
+  let ready;
+  if(actx.state === 'running') ready = Promise.resolve();
+  else {
+    const timeout = new Promise(res => setTimeout(res, 250));
+    ready = Promise.race([actx.resume().catch(()=>{}), timeout]).then(()=>{
+      if(actx.state !== 'running'){
+        try{ actx.close(); }catch(e){}
+        actx = new (window.AudioContext || window.webkitAudioContext)();
+        return actx.resume().catch(()=>{});
+      }
+    });
+  }
+  return ready.then(()=> prepFeedback(actx));
 }
 
 document.addEventListener('visibilitychange', ()=>{
@@ -588,32 +642,72 @@ function schedule(a, pos){
       return rootFreq(targetsOf(op)[0]);
     }
 
-    const oscs = {};
+    const oscs = {}, freqOf = {}, outOf = {};
+    const [fbSrc, fbDst] = a.f;
+    const fb = !!actx._fbReady;
     for(let op=1; op<=6; op++){
       if(!pos[op]) continue;
-      const o = actx.createOscillator();
       const lv = pos[op].y;
       const ratio = a.c.includes(op) ? 1 : (lv===1 ? 2 : lv===2 ? 3 : 4.5);
-      o.frequency.value = rootFreq(op) * ratio;
-      oscs[op] = o;
+      const freq = rootFreq(op) * ratio;
+      freqOf[op] = freq;
+      if(fb && op === fbDst){
+        // the looped operator — phase feedback happens inside the worklet
+        const w = new AudioWorkletNode(actx, 'fb-op', {
+          numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
+          processorOptions: { freq, beta: fbSrc === fbDst ? FB_BETA : 0,
+                              life: Math.ceil((dur + 0.5) * actx.sampleRate) }
+        });
+        oscs[op] = w;
+        if(fbSrc !== fbDst){
+          // phase modulation at a commensurate ratio puts a genuine DC term
+          // (the sideband that lands on 0 Hz) in this op's output; block it
+          // before it reaches any .frequency param, where it would integrate
+          // into a steady detune. Self-feedback output has no DC term.
+          const hp = actx.createBiquadFilter();
+          hp.type = 'highpass'; hp.frequency.value = 8;
+          w.connect(hp); outOf[op] = hp;
+        }
+      } else {
+        const o = actx.createOscillator();
+        o.frequency.value = freq;
+        oscs[op] = o;
+      }
     }
 
     a.c.forEach(op=>{
       const g = actx.createGain();
       g.gain.value = 0.9 / a.c.length;
-      oscs[op].connect(g); g.connect(master);
+      (outOf[op] || oscs[op]).connect(g); g.connect(master);
     });
 
+    // in all 32 algorithms the feedback destination is never also a normal FM
+    // target, so oscs[tt] here is always a plain oscillator with .frequency
     a.m.forEach(([s,tt])=>{
       const lv = pos[s].y;
-      const idx = [0, 2.4, 1.7, 1.2][Math.min(lv,3)] * oscs[tt].frequency.value;
+      const idx = [0, 2.4, 1.7, 1.2][Math.min(lv,3)] * freqOf[tt];
       const g = actx.createGain();
       g.gain.setValueAtTime(idx, t);
       g.gain.exponentialRampToValueAtTime(idx*0.04 + 0.01, t + 1.1);
-      oscs[s].connect(g); g.connect(oscs[tt].frequency);
+      (outOf[s] || oscs[s]).connect(g); g.connect(oscs[tt].frequency);
     });
 
-    Object.values(oscs).forEach(o=>{ o.start(t); o.stop(t + dur + 0.1); });
+    // Loop feedback (algorithms 4 and 6): the cycle spans other operators, so
+    // it must cross the node graph — and Web Audio only permits a cycle that
+    // contains a DelayNode, clamped to one 128-sample render quantum. Feeding
+    // that stale copy into the worklet's *phase* keeps the pitch stable: a
+    // biased phase input merely offsets phase, where the same bias on a
+    // frequency param would integrate into an audible detune.
+    if(fb && fbSrc !== fbDst && oscs[fbSrc] && oscs[fbDst]){
+      const delay = actx.createDelay();
+      delay.delayTime.value = 128 / actx.sampleRate;
+      const g = actx.createGain();
+      g.gain.setValueAtTime(FB_LOOP, t);
+      g.gain.exponentialRampToValueAtTime(FB_LOOP*0.04 + 0.01, t + 1.1);
+      oscs[fbSrc].connect(delay); delay.connect(g); g.connect(oscs[fbDst]);
+    }
+
+    Object.values(oscs).forEach(o=>{ if(o.start){ o.start(t); o.stop(t + dur + 0.1); } });
   }catch(e){ /* audio unavailable — page stays visual-only */ }
 }
 
