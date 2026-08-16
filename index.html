@@ -268,6 +268,13 @@
     font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted);
   }
 
+  /* the shared patch, printed from the same constants the audio uses */
+  .patch {
+    font-size: 11px; letter-spacing: 0.04em; text-transform: none;
+    margin: 0 0 10px;
+  }
+  .patch strong { color: var(--ink); font-weight: 600; }
+
   /* SVG parts */
   .opbox-mod { fill: var(--modulator); }
   .opbox-car { fill: var(--carrier); }
@@ -346,7 +353,10 @@
     </aside>
   </div>
 
-  <footer>6 operators &middot; 32 algorithms &middot; DX-compatible routing</footer>
+  <footer>
+    <p class="patch" id="patchLine"></p>
+    6 operators &middot; 32 algorithms &middot; DX-compatible routing
+  </footer>
 </div>
 
 <script>
@@ -552,6 +562,26 @@ const FB_LOOP = 0.2; // loop feedback (algos 4 & 6) phase-mod depth (radians).
                      // a one-quantum delay, and larger depths push the delayed
                      // cycle past unity gain into inharmonic self-oscillation.
 
+// The rest of the shared patch. RATIOS and INDEX go by diagram row — how many
+// rows a modulator sits above the carriers. Integer ratios keep every sideband
+// on the harmonic grid of the root, which is most of what separates "rich"
+// from "clangorous"; FM depth fades over MOD_DECAY so notes open bright and
+// settle sweet. These same constants are printed into #patchLine below, so
+// the page can't drift from the sound.
+const ROOT = 220;         // carrier root (A3); the nth carrier plays ROOT * n
+const DUR = 1.8;          // note length, seconds
+const MOD_DECAY = 0.8;    // FM-depth decay, seconds — the brightness envelope
+const RATIOS = [1, 2, 3, 4];       // modulator frequency ratio by row
+const INDEX  = [0, 2.0, 1.4, 1.0]; // FM depth by row, × target freq in Hz
+const TONE_LP = 4200;     // gentle master low-pass, Hz — rounds off the fizz
+
+document.getElementById('patchLine').innerHTML =
+  `<strong>one patch, 32 wirings</strong> — root ${ROOT} Hz &middot; ` +
+  `mod ratio &times;${RATIOS[1]} / &times;${RATIOS[2]} / &times;${RATIOS[3]} by row &middot; ` +
+  `fm depth ${INDEX[1]} / ${INDEX[2]} / ${INDEX[3]}, fading over ${MOD_DECAY} s &middot; ` +
+  `feedback ${FB_BETA} self, ${FB_LOOP} loop &middot; ` +
+  `tone ${(TONE_LP/1000).toFixed(1)} kHz low-pass &middot; note ${DUR} s`;
+
 // A feedback operator needs its own output folded back into its phase on the
 // next sample — a per-sample cycle no plain node graph can express — so the
 // looped operator runs as a tiny inline AudioWorklet. Averaging the last two
@@ -565,7 +595,7 @@ registerProcessor('fb-op', class extends AudioWorkletProcessor {
     const p = o.processorOptions;
     this.inc = 2 * Math.PI * p.freq / sampleRate;
     this.beta = p.beta; this.betaMin = p.beta * 0.04;
-    this.decay = Math.pow(0.04, 1 / (1.1 * sampleRate)); // mirror the modulator envelope
+    this.decay = Math.pow(0.04, 1 / (${MOD_DECAY} * sampleRate)); // mirror the modulator envelope
     this.life = p.life; this.phase = 0; this.s1 = 0; this.s2 = 0; this.n = 0;
   }
   process(inputs, outputs){
@@ -624,18 +654,31 @@ function play(a, pos){
 
 function schedule(a, pos){
   try{
-    if(liveMaster){ try{ liveMaster.disconnect(); }catch(e){} }
+    if(liveMaster){
+      // retrigger: fade the old note over 30 ms rather than cutting it
+      // mid-waveform, which clicked on every new selection
+      const old = liveMaster, now = actx.currentTime;
+      try{
+        old.gain.cancelScheduledValues(now);
+        old.gain.setValueAtTime(old.gain.value, now);
+        old.gain.linearRampToValueAtTime(0, now + 0.03);
+        setTimeout(()=>{ try{ old.disconnect(); }catch(e){} }, 120);
+      }catch(e){ try{ old.disconnect(); }catch(e2){} }
+    }
 
-    const t = actx.currentTime, dur = 1.8;
+    const t = actx.currentTime, dur = DUR;
     const master = actx.createGain();
     master.gain.setValueAtTime(0.0001, t);
     master.gain.linearRampToValueAtTime(0.45, t + 0.012);
     master.gain.exponentialRampToValueAtTime(0.001, t + dur);
-    master.connect(actx.destination);
+    master.gain.linearRampToValueAtTime(0, t + dur + 0.08);
+    const tone = actx.createBiquadFilter();
+    tone.type = 'lowpass'; tone.frequency.value = TONE_LP;
+    master.connect(tone); tone.connect(actx.destination);
     liveMaster = master;
 
     const carFreq = {};
-    a.c.forEach((op,i)=>{ carFreq[op] = 220 * (i+1); });
+    a.c.forEach((op,i)=>{ carFreq[op] = ROOT * (i+1); });
     const targetsOf = op => a.m.filter(([s])=>s===op).map(([,tt])=>tt);
     function rootFreq(op){
       if(carFreq[op]) return carFreq[op];
@@ -648,7 +691,7 @@ function schedule(a, pos){
     for(let op=1; op<=6; op++){
       if(!pos[op]) continue;
       const lv = pos[op].y;
-      const ratio = a.c.includes(op) ? 1 : (lv===1 ? 2 : lv===2 ? 3 : 4.5);
+      const ratio = a.c.includes(op) ? 1 : RATIOS[Math.min(lv,3)];
       const freq = rootFreq(op) * ratio;
       freqOf[op] = freq;
       if(fb && op === fbDst){
@@ -659,15 +702,15 @@ function schedule(a, pos){
                               life: Math.ceil((dur + 0.5) * actx.sampleRate) }
         });
         oscs[op] = w;
-        if(fbSrc !== fbDst){
-          // phase modulation at a commensurate ratio puts a genuine DC term
-          // (the sideband that lands on 0 Hz) in this op's output; block it
-          // before it reaches any .frequency param, where it would integrate
-          // into a steady detune. Self-feedback output has no DC term.
-          const hp = actx.createBiquadFilter();
-          hp.type = 'highpass'; hp.frequency.value = 8;
-          w.connect(hp); outOf[op] = hp;
-        }
+        // Feedback phase modulation skews the operator's waveform asymmetric,
+        // which is a genuine DC term — self-feedback sits near -0.16 at full
+        // depth, and the loop form puts a sideband right on 0 Hz. Block it
+        // before the output reaches any .frequency param, where it would
+        // integrate into a steady detune. The worklet's own per-sample
+        // feedback still sees the raw signal internally.
+        const hp = actx.createBiquadFilter();
+        hp.type = 'highpass'; hp.frequency.value = 8;
+        w.connect(hp); outOf[op] = hp;
       } else {
         const o = actx.createOscillator();
         o.frequency.value = freq;
@@ -675,9 +718,12 @@ function schedule(a, pos){
       }
     }
 
-    a.c.forEach(op=>{
+    // higher carriers sit at higher harmonics of the root; roll their level
+    // off like drawbars so thick stacks read as one warm chord, not a cluster
+    const wsum = a.c.reduce((s,_,i)=> s + 1/Math.sqrt(i+1), 0);
+    a.c.forEach((op,i)=>{
       const g = actx.createGain();
-      g.gain.value = 0.9 / a.c.length;
+      g.gain.value = 0.9 / Math.sqrt(i+1) / wsum;
       (outOf[op] || oscs[op]).connect(g); g.connect(master);
     });
 
@@ -685,10 +731,10 @@ function schedule(a, pos){
     // target, so oscs[tt] here is always a plain oscillator with .frequency
     a.m.forEach(([s,tt])=>{
       const lv = pos[s].y;
-      const idx = [0, 2.4, 1.7, 1.2][Math.min(lv,3)] * freqOf[tt];
+      const idx = INDEX[Math.min(lv,3)] * freqOf[tt];
       const g = actx.createGain();
       g.gain.setValueAtTime(idx, t);
-      g.gain.exponentialRampToValueAtTime(idx*0.04 + 0.01, t + 1.1);
+      g.gain.exponentialRampToValueAtTime(idx*0.04 + 0.01, t + MOD_DECAY);
       (outOf[s] || oscs[s]).connect(g); g.connect(oscs[tt].frequency);
     });
 
@@ -703,7 +749,7 @@ function schedule(a, pos){
       delay.delayTime.value = 128 / actx.sampleRate;
       const g = actx.createGain();
       g.gain.setValueAtTime(FB_LOOP, t);
-      g.gain.exponentialRampToValueAtTime(FB_LOOP*0.04 + 0.01, t + 1.1);
+      g.gain.exponentialRampToValueAtTime(FB_LOOP*0.04 + 0.01, t + MOD_DECAY);
       oscs[fbSrc].connect(delay); delay.connect(g); g.connect(oscs[fbDst]);
     }
 
